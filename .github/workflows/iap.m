@@ -3,28 +3,22 @@
 #import <StoreKit/StoreKit.h>
 #import <UIKit/UIKit.h>
 
-#pragma mark - Anti-Detect
-
-// Giả lập môi trường sạch, không bị phát hiện tweak
-static BOOL fake_debugger(id self, SEL _cmd) { return NO; }
-static int fake_ptrace(int a, int b, int c, int d) { return 0; }
-static int fake_sysctl(int *a, unsigned int b, void *c, size_t *d, void *e, size_t f) { return 0; }
-
-#pragma mark - Fake Transaction
+#pragma mark - Fake Transaction Class
 
 @interface FakeSKPaymentTransaction : NSObject
-@property (copy) NSString *productIdentifier;
-@property (copy) NSString *transactionIdentifier;
-@property (copy) NSDate *transactionDate;
-@property NSInteger transactionState;
-@property (copy) NSError *error;
-@property (strong) NSData *transactionReceipt;
-@property (strong) SKPayment *payment;
+@property (nonatomic, copy) NSString *productIdentifier;
+@property (nonatomic, copy) NSString *transactionIdentifier;
+@property (nonatomic, copy) NSDate *transactionDate;
+@property (nonatomic, assign) NSInteger transactionState;
+@property (nonatomic, strong) NSError *error;
+@property (nonatomic, strong) NSData *transactionReceipt;
+@property (nonatomic, strong) SKPayment *payment;
 @end
 
 @implementation FakeSKPaymentTransaction
 - (instancetype)init {
-    if (self = [super init]) {
+    self = [super init];
+    if (self) {
         _transactionState = 1;
         _transactionDate = [NSDate date];
         _transactionIdentifier = [[NSUUID UUID] UUIDString];
@@ -34,7 +28,7 @@ static int fake_sysctl(int *a, unsigned int b, void *c, size_t *d, void *e, size
 }
 @end
 
-#pragma mark - SKPaymentQueue
+#pragma mark - SKPaymentQueue Hooks
 
 static void (*orig_addPayment)(id, SEL, SKPayment*);
 static void hook_addPayment(id self, SEL _cmd, SKPayment *payment) {
@@ -43,7 +37,8 @@ static void hook_addPayment(id self, SEL _cmd, SKPayment *payment) {
     fake.payment = payment;
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 0.3 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        for (id obs in [self valueForKey:@"transactionObservers"]) {
+        NSArray *observers = [self valueForKey:@"transactionObservers"];
+        for (id obs in observers) {
             if ([obs respondsToSelector:@selector(paymentQueue:updatedTransactions:)]) {
                 [obs paymentQueue:self updatedTransactions:@[fake]];
             }
@@ -52,9 +47,16 @@ static void hook_addPayment(id self, SEL _cmd, SKPayment *payment) {
 }
 
 static void (*orig_finish)(id, SEL, id);
-static void hook_finish(id self, SEL _cmd, id t) { orig_finish(self, _cmd, t); }
+static void hook_finish(id self, SEL _cmd, id t) {
+    orig_finish(self, _cmd, t);
+}
 
-#pragma mark - NSUserDefaults
+static id (*orig_transactions)(id, SEL);
+static id hook_transactions(id self, SEL _cmd) {
+    return @[];
+}
+
+#pragma mark - NSUserDefaults Hooks
 
 static id (*orig_obj)(id, SEL, NSString*);
 static id hook_obj(id self, SEL _cmd, NSString *k) {
@@ -64,7 +66,9 @@ static id hook_obj(id self, SEL _cmd, NSString *k) {
         [l containsString:@"premium"]||[l containsString:@"vip"]||[l containsString:@"pro"]||
         [l containsString:@"buy"]||[l containsString:@"paid"]||[l containsString:@"member"]||
         [l containsString:@"subscribe"]||[l containsString:@"coin"]||[l containsString:@"gem"]||
-        [l containsString:@"diamond"]||[l containsString:@"gold"]||[l containsString:@"cash"]) return @"1";
+        [l containsString:@"diamond"]||[l containsString:@"gold"]||[l containsString:@"cash"]) {
+        return @"1";
+    }
     if ([l containsString:@"expire"]||[l containsString:@"end"]) return @(4102444800);
     if ([l containsString:@"level"]||[l containsString:@"tier"]) return @"999";
     return orig_obj ? orig_obj(self, _cmd, k) : nil;
@@ -81,65 +85,40 @@ static BOOL hook_bool(id self, SEL _cmd, NSString *k) {
     return orig_bool ? orig_bool(self, _cmd, k) : NO;
 }
 
-#pragma mark - Chặn API Verify Receipt
+static BOOL (*orig_sync)(id, SEL);
+static BOOL hook_sync(id self, SEL _cmd) {
+    return YES;
+}
 
-static void hookURLProtocol(void) {
-    Class URLP = NSClassFromString(@"NSURLProtocol");
-    if (!URLP) return;
+#pragma mark - NSURLSession Hook
+
+static id (*orig_dataTask)(id, SEL, id, id);
+static id hook_dataTask(id self, SEL _cmd, id request, id handler) {
+    NSURL *url = [request valueForKey:@"URL"];
+    NSString *str = [url absoluteString];
+    NSString *lower = [str lowercaseString];
     
-    // Hook NSURLSession
-    Class session = [NSURLSession class];
-    SEL sel = @selector(dataTaskWithRequest:completionHandler:);
-    Method m = class_getInstanceMethod(session, sel);
-    if (m) {
-        IMP old = method_getImplementation(m);
-        IMP new = imp_implementationWithBlock(^(id self, id request, id handler) {
-            NSURL *url = [request valueForKey:@"URL"];
-            NSString *str = url.absoluteString.lowercaseString;
-            
-            if ([str containsString:@"verifyreceipt"]||[str containsString:@"iap"]||
-                [str containsString:@"purchase"]||[str containsString:@"buy"]||
-                [str containsString:@"payment"]||[str containsString:@"order"]||
-                [str containsString:@"unlock"]||[str containsString:@"premium"]||
-                [str containsString:@"vip/check"]||[str containsString:@"subscription/check"]) {
-                
-                NSDictionary *fake = @{@"status":@0,@"code":@200,@"success":@YES,
-                    @"data":@{@"valid":@YES,@"purchased":@YES,@"unlocked":@YES,@"premium":@YES,@"vip":@YES}};
-                NSData *data = [NSJSONSerialization dataWithJSONObject:fake options:0 error:nil];
-                NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc] initWithURL:url statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{@"Content-Type":@"application/json"}];
-                if (handler) ((void(^)(NSData*,NSURLResponse*,NSError*))handler)(data, resp, nil);
-                return (id)nil;
-            }
-            return ((id(*)(id,SEL,id,id))old)(self, sel, request, handler);
-        });
-        method_setImplementation(m, new);
-    }
-}
-
-#pragma mark - Keychain
-
-static void hookKeychain(void) {
-    Class kc = NSClassFromString(@"SFHFKeychainUtils");
-    if (kc) {
-        SEL sel = @selector(getPasswordForUsername:andServiceName:error:);
-        Method m = class_getClassMethod(kc, sel);
-        if (m) {
-            IMP old = method_getImplementation(m);
-            IMP new = imp_implementationWithBlock(^(id self, id user, id service, id *err) {
-                NSString *s = [service lowercaseString];
-                if ([s containsString:@"receipt"]||[s containsString:@"purchase"]||[s containsString:@"iap"]) {
-                    return @"fake_receipt_data";
-                }
-                return ((id(*)(id,SEL,id,id,id*))old)(self, sel, user, service, err);
-            });
-            method_setImplementation(m, new);
+    if ([lower containsString:@"verifyreceipt"]||[lower containsString:@"/iap/"]||
+        [lower containsString:@"/purchase/"]||[lower containsString:@"/buy/"]||
+        [lower containsString:@"/payment/"]||[lower containsString:@"/order/"]||
+        [lower containsString:@"/unlock/"]||[lower containsString:@"/premium/"]||
+        [lower containsString:@"/vip/check"]||[lower containsString:@"/subscription/"]) {
+        
+        NSDictionary *fake = @{@"status":@0,@"code":@200,@"success":@YES,
+            @"data":@{@"valid":@YES,@"purchased":@YES,@"unlocked":@YES,@"premium":@YES,@"vip":@YES}};
+        NSData *data = [NSJSONSerialization dataWithJSONObject:fake options:0 error:nil];
+        NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc] initWithURL:url statusCode:200 HTTPVersion:@"HTTP/1.1" headerFields:@{@"Content-Type":@"application/json"}];
+        if (handler) {
+            ((void(^)(NSData*,NSURLResponse*,NSError*))handler)(data, resp, nil);
         }
+        return nil;
     }
+    return orig_dataTask ? orig_dataTask(self, _cmd, request, handler) : nil;
 }
 
-#pragma mark - Runtime Hook All Classes
+#pragma mark - Runtime Class Hook
 
-static void hookAllClasses(void) {
+static void hookAllSelectors(void) {
     unsigned int count;
     Class *classes = objc_copyClassList(&count);
     const char *sels[] = {
@@ -148,16 +127,20 @@ static void hookAllClasses(void) {
         "hasPremium","hasSubscription","isSubscribed","isMember","isFeatureUnlocked",
         "isFullVersion","isPaidUser","isPremiumUser","hasValidSubscription",
         "isVIPActive","isVIPValid","canUseVIPFeature","hasVIPPermission",
-        "hasPurchasedProduct","isProductOwned","isItemOwned","isContentUnlocked",
         NULL
     };
     for (unsigned int i = 0; i < count; i++) {
-        for (int j = 0; sels[j]; j++) {
+        Class cls = classes[i];
+        for (int j = 0; sels[j] != NULL; j++) {
             SEL s = sel_registerName(sels[j]);
-            Method m = class_getInstanceMethod(classes[i], s);
-            if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id self, SEL _cmd){return YES;}));
-            m = class_getClassMethod(classes[i], s);
-            if (m) method_setImplementation(m, imp_implementationWithBlock(^BOOL(id self, SEL _cmd){return YES;}));
+            Method m = class_getInstanceMethod(cls, s);
+            if (m) {
+                method_setImplementation(m, imp_implementationWithBlock(^BOOL(id _self, SEL _cmd) { return YES; }));
+            }
+            m = class_getClassMethod(cls, s);
+            if (m) {
+                method_setImplementation(m, imp_implementationWithBlock(^BOOL(id _self, SEL _cmd) { return YES; }));
+            }
         }
     }
     free(classes);
@@ -166,44 +149,42 @@ static void hookAllClasses(void) {
 #pragma mark - Constructor
 
 __attribute__((constructor))
-static void init(void) {
+static void IAPGodProInit(void) {
     @autoreleasepool {
         // SKPaymentQueue
-        Class q = [SKPaymentQueue class];
-        Method m1 = class_getInstanceMethod(q, @selector(addPayment:));
-        if(m1){orig_addPayment=(void*)method_getImplementation(m1);method_setImplementation(m1,(IMP)hook_addPayment);}
-        Method m2 = class_getInstanceMethod(q, @selector(finishTransaction:));
-        if(m2){orig_finish=(void*)method_getImplementation(m2);method_setImplementation(m2,(IMP)hook_finish);}
+        Class skq = [SKPaymentQueue class];
+        Method m1 = class_getInstanceMethod(skq, @selector(addPayment:));
+        if (m1) { orig_addPayment = (void*)method_getImplementation(m1); method_setImplementation(m1, (IMP)hook_addPayment); }
+        Method m2 = class_getInstanceMethod(skq, @selector(finishTransaction:));
+        if (m2) { orig_finish = (void*)method_getImplementation(m2); method_setImplementation(m2, (IMP)hook_finish); }
+        Method m3 = class_getInstanceMethod(skq, @selector(transactions));
+        if (m3) { orig_transactions = (void*)method_getImplementation(m3); method_setImplementation(m3, (IMP)hook_transactions); }
         
         // NSUserDefaults
-        Class u = [NSUserDefaults class];
-        Method m3 = class_getInstanceMethod(u, @selector(objectForKey:));
-        if(m3){orig_obj=(void*)method_getImplementation(m3);method_setImplementation(m3,(IMP)hook_obj);}
-        Method m4 = class_getInstanceMethod(u, @selector(boolForKey:));
-        if(m4){orig_bool=(void*)method_getImplementation(m4);method_setImplementation(m4,(IMP)hook_bool);}
-        Method m5 = class_getInstanceMethod(u, @selector(stringForKey:));
-        if(m5) method_setImplementation(m5, (IMP)hook_obj);
-        Method m6 = class_getInstanceMethod(u, @selector(valueForKey:));
-        if(m6) method_setImplementation(m6, (IMP)hook_obj);
-        Method m7 = class_getInstanceMethod(u, @selector(dictionaryForKey:));
-        if(m7) method_setImplementation(m7, (IMP)hook_obj);
-        Method m8 = class_getInstanceMethod(u, @selector(integerForKey:));
-        if(m8) method_setImplementation(m8, (IMP)hook_obj);
+        Class ud = [NSUserDefaults class];
+        Method m4 = class_getInstanceMethod(ud, @selector(objectForKey:));
+        if (m4) { orig_obj = (void*)method_getImplementation(m4); method_setImplementation(m4, (IMP)hook_obj); }
+        Method m5 = class_getInstanceMethod(ud, @selector(boolForKey:));
+        if (m5) { orig_bool = (void*)method_getImplementation(m5); method_setImplementation(m5, (IMP)hook_bool); }
+        Method m6 = class_getInstanceMethod(ud, @selector(stringForKey:));
+        if (m6) method_setImplementation(m6, (IMP)hook_obj);
+        Method m7 = class_getInstanceMethod(ud, @selector(valueForKey:));
+        if (m7) method_setImplementation(m7, (IMP)hook_obj);
+        Method m8 = class_getInstanceMethod(ud, @selector(dictionaryForKey:));
+        if (m8) method_setImplementation(m8, (IMP)hook_obj);
+        Method m9 = class_getInstanceMethod(ud, @selector(integerForKey:));
+        if (m9) method_setImplementation(m9, (IMP)hook_obj);
+        Method m10 = class_getInstanceMethod(ud, @selector(synchronize));
+        if (m10) { orig_sync = (void*)method_getImplementation(m10); method_setImplementation(m10, (IMP)hook_sync); }
         
-        // Anti detect
-        Class dbg = NSClassFromString(@"NSDebugger");
-        if (dbg) {
-            Method m9 = class_getClassMethod(dbg, @selector(isDebuggerAttached));
-            if(m9) method_setImplementation(m9, (IMP)fake_debugger);
-        }
+        // NSURLSession
+        Class session = [NSURLSession class];
+        Method m11 = class_getInstanceMethod(session, @selector(dataTaskWithRequest:completionHandler:));
+        if (m11) { orig_dataTask = (void*)method_getImplementation(m11); method_setImplementation(m11, (IMP)hook_dataTask); }
         
-        // API intercept
-        hookURLProtocol();
-        hookKeychain();
+        // Runtime
+        hookAllSelectors();
         
-        // All classes
-        hookAllClasses();
-        
-        NSLog(@"[IAP_GOD_PRO] ✓ ALL IAP BYPASSED + API FAKED");
+        NSLog(@"[IAP_GOD_PRO] LOADED SUCCESSFULLY");
     }
 }
