@@ -1,0 +1,25 @@
+name: IAP_God_Pro
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+            -mios-version-min=14.0 \
+            -framework Foundation \
+            -framework StoreKit \
+            -framework Security \
+            -framework UIKit \
+            -o IAP_God_Pro.dylib \
+            iap.m \
+            -Xlinker -dead_strip \
+            -fobjc-arc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: IAP_God_Pro
+          path: IAP_God_Pro.dylib
