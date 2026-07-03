@@ -15,6 +15,7 @@ jobs:
             -framework StoreKit \
             -framework Security \
             -framework UIKit \
+            -framework QuartzCore \
             -o IAP_God_Pro.dylib \
             iap.m \
             -Xlinker -dead_strip \
